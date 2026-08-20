@@ -5,11 +5,16 @@ GPU acceleration via CUDA with automatic CPU fallback.
 """
 
 import math
+import os
+import subprocess
+import tempfile
 import time
 import threading
 import numpy as np
 
 from PySide6.QtCore import QThread, Signal
+
+from src.runtime_paths import ffmpeg_path
 
 try:
     import torch
@@ -17,8 +22,13 @@ try:
     from demucs.pretrained import get_model
     from demucs.apply import apply_model
     DEMUCS_AVAILABLE = True
-except ImportError:
+    DEMUCS_IMPORT_ERROR: str | None = None
+except Exception as exc:
+    # Se captura Exception y no solo ImportError: en el .exe congelado un fallo
+    # de carga de DLL llega como OSError y antes tumbaba la app entera. El motivo
+    # se conserva porque sin él "Demucs no está instalado" no es diagnosticable.
     DEMUCS_AVAILABLE = False
+    DEMUCS_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 try:
     import soundfile as sf
@@ -60,12 +70,13 @@ class SeparationWorker(QThread):
     Background thread that runs Demucs separation and emits Qt signals.
     Signals:
         progress(int, str)  – 0-100 percent + status message
-        finished(dict)      – {stem_name: np.ndarray (samples, 2)}  float32 stereo
+        finished(dict, int) – {stem_name: np.ndarray (samples, 2)} float32 stereo,
+                              más el samplerate real del modelo
         error(str)          – error message
     """
 
     progress = Signal(int, str)
-    finished = Signal(dict)
+    finished = Signal(dict, int)
     error = Signal(str)
 
     def __init__(self, file_path: str, parent=None):
@@ -79,9 +90,9 @@ class SeparationWorker(QThread):
 
     def run(self):
         try:
-            result = self._separate()
+            stems, samplerate = self._separate()
             if not self._cancelled:
-                self.finished.emit(result)
+                self.finished.emit(stems, samplerate)
         except Exception as exc:
             if not self._cancelled:
                 self.error.emit(str(exc))
@@ -92,11 +103,10 @@ class SeparationWorker(QThread):
         if not self._cancelled:
             self.progress.emit(pct, msg)
 
-    def _separate(self) -> dict:
+    def _separate(self) -> tuple[dict, int]:
         if not DEMUCS_AVAILABLE:
             raise RuntimeError(
-                "Demucs no está instalado. Ejecuta:\n"
-                "  pip install demucs torch torchaudio"
+                f"No se pudo cargar Demucs.\n{DEMUCS_IMPORT_ERROR}"
             )
 
         # ── 1. Load model ─────────────────────────────────────────────
@@ -164,7 +174,7 @@ class SeparationWorker(QThread):
             fake_prog.join(timeout=2)
 
         if self._cancelled:
-            return {}
+            return {}, model_sr
 
         self._emit(90, "Convirtiendo resultados…")
 
@@ -177,30 +187,49 @@ class SeparationWorker(QThread):
             result[name] = stem_np
 
         self._emit(100, "¡Separación completada!")
-        return result
+        # El samplerate viaja con los stems: apply_model devuelve audio a la tasa
+        # del modelo, no a la del archivo original. Antes se asumía 44100 en la UI.
+        return result, model_sr
 
     def _load_audio(self, path: str):
         """Load audio file, return (tensor (channels, samples), sr)."""
-        # Try torchaudio first (handles MP3, WAV, FLAC, M4A via ffmpeg backend)
-        try:
-            wav, sr = torchaudio.load(path)
-            return wav, sr
-        except Exception:
-            pass
-
-        # Fallback: soundfile (WAV, FLAC)
+        # soundfile/libsndfile cubre WAV, FLAC, MP3 y OGG de forma nativa.
         if SOUNDFILE_AVAILABLE:
             try:
                 data, sr = sf.read(path, dtype='float32', always_2d=True)
-                wav = torch.tensor(data.T)  # (channels, samples)
-                return wav, sr
+                return torch.tensor(data.T), sr  # (channels, samples)
             except Exception:
                 pass
 
-        raise RuntimeError(
-            f"No se pudo leer el archivo: {path}\n"
-            "Asegúrate de que ffmpeg esté instalado para MP3/M4A."
-        )
+        # M4A/AAC y demás formatos exóticos: decodificar con ffmpeg a WAV temporal.
+        try:
+            return self._load_via_ffmpeg(path)
+        except Exception as exc:
+            raise RuntimeError(
+                f"No se pudo leer el archivo: {path}\n{exc}"
+            ) from exc
+
+    def _load_via_ffmpeg(self, path: str):
+        """Decodifica cualquier formato soportado por ffmpeg a float32 estéreo."""
+        ffmpeg = ffmpeg_path()
+        if not ffmpeg:
+            raise RuntimeError("ffmpeg no disponible para decodificar este formato.")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, 'decoded.wav')
+            proc = subprocess.run(
+                [ffmpeg, '-nostdin', '-loglevel', 'error', '-y',
+                 '-i', path, '-vn', '-f', 'wav', '-c:a', 'pcm_f32le', out],
+                capture_output=True,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+            )
+            if proc.returncode != 0 or not os.path.exists(out):
+                raise RuntimeError(
+                    proc.stderr.decode('utf-8', 'replace').strip() or
+                    "ffmpeg no pudo decodificar el archivo."
+                )
+            data, sr = sf.read(out, dtype='float32', always_2d=True)
+            return torch.tensor(data.T), sr
 
 
 class AISeparator:
@@ -215,6 +244,11 @@ class AISeparator:
     @staticmethod
     def is_available() -> bool:
         return DEMUCS_AVAILABLE
+
+    @staticmethod
+    def unavailable_reason() -> str | None:
+        """Motivo real del fallo de import, o None si Demucs cargó bien."""
+        return DEMUCS_IMPORT_ERROR
 
     @staticmethod
     def supported_formats() -> set:

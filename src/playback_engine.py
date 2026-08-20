@@ -5,10 +5,11 @@ Supports variable playback speed (with linear interpolation) and A-B loop.
 VU peak levels are written to shared numpy arrays for UI polling.
 """
 
-import math
 import threading
 import numpy as np
 from typing import Dict, Optional, Callable, Tuple
+
+from src import mixing
 
 try:
     import sounddevice as sd
@@ -31,6 +32,9 @@ class PlaybackEngine:
         # Fractional source position (supports variable speed)
         self._frac_pos: float = 0.0
         self._speed: float = 1.0
+
+        # Master output gain (applied after the per-stem mix)
+        self._master_volume: float = 1.0
 
         # A-B loop points (in source frames, None = not set)
         self._loop_a: Optional[int] = None
@@ -75,6 +79,14 @@ class PlaybackEngine:
     @property
     def speed(self) -> float:
         return self._speed
+
+    @property
+    def master_volume(self) -> float:
+        return self._master_volume
+
+    def set_master_volume(self, vol: float):
+        with self._lock:
+            self._master_volume = max(0.0, min(2.0, float(vol)))
 
     @property
     def loop_points(self) -> Tuple[Optional[int], Optional[int]]:
@@ -199,6 +211,7 @@ class PlaybackEngine:
             total    = self._total_frames
             loop_a   = self._loop_a
             loop_b   = self._loop_b
+            master   = self._master_volume
             loop_active = (loop_a is not None and loop_b is not None
                            and loop_b > loop_a)
 
@@ -226,16 +239,13 @@ class PlaybackEngine:
             idx1  = np.minimum(idx0 + 1, total - 1)
 
             mixed = np.zeros((frames, 2), dtype=np.float32)
-            any_soloed = any(p.get('soloed', False) for p in self._params.values())
+            solo_active = mixing.any_soloed(self._params)
 
             for name, audio in self._stems.items():
                 params = self._params.get(name)
                 if params is None:
                     continue
-                if params['muted']:
-                    self.peak_levels[name][:] = 0.0
-                    continue
-                if any_soloed and not params['soloed']:
+                if not mixing.is_audible(params, solo_active):
                     self.peak_levels[name][:] = 0.0
                     continue
 
@@ -246,11 +256,9 @@ class PlaybackEngine:
                 if not valid.all():
                     chunk[~valid] = 0.0
 
-                vol   = float(params['volume'])
-                pan   = float(params['pan'])
-                angle = (pan + 1.0) * (math.pi / 4.0)
-                l_g   = vol * math.cos(angle)
-                r_g   = vol * math.sin(angle)
+                # Misma ley que usa la exportacion, definida en src/mixing.py
+                l_g, r_g = mixing.stem_gains(params)
+                vol = float(params['volume'])   # el VU se mide antes del paneo
 
                 mixed[:, 0] += chunk[:, 0] * l_g
                 mixed[:, 1] += chunk[:, 1] * r_g
@@ -265,6 +273,9 @@ class PlaybackEngine:
                 else:
                     pk[0] *= PEAK_DECAY
                     pk[1] *= PEAK_DECAY
+
+            if master != 1.0:
+                mixed *= master
 
             np.clip(mixed, -1.0, 1.0, out=mixed)
             outdata[:] = mixed

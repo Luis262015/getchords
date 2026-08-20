@@ -1,9 +1,9 @@
 import sys
-import os
 
-# Fix common PyTorch/OpenMP conflict on Windows
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
-os.environ['OMP_NUM_THREADS'] = '1'
+from src.runtime_paths import configure_runtime, log_startup
+
+# Debe ejecutarse antes de importar torch/demucs (fija TORCH_HOME y flags de OpenMP).
+configure_runtime()
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt
@@ -13,6 +13,11 @@ from src.ui.main_window import MainWindow
 
 
 def main():
+    try:
+        log_startup()
+    except Exception:
+        pass  # el diagnóstico nunca debe impedir que arranque la app
+
     app = QApplication(sys.argv)
     app.setApplicationName("GetChords Studio")
     app.setOrganizationName("GetChords")

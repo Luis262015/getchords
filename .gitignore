@@ -1,0 +1,16 @@
+# Artefactos de compilación de PyInstaller
+build/
+dist/
+*.manifest
+
+# Entorno virtual
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# IDE
+.idea/
+.antigravitycli/

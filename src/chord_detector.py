@@ -12,7 +12,7 @@ Output: list[ChordEvent] with timestamps, used for real-time display.
 from __future__ import annotations
 
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 from PySide6.QtCore import QThread, Signal
 
@@ -76,21 +76,46 @@ _QUALITY_PROFILES: dict[str, np.ndarray] = {
     'hdim7': np.array([1,0,0,1,0,0,1,0,0,0,1,0], float),   # R  m3  d5  m7
 }
 
+# Qualities the librosa backend is allowed to output. Restricted to the
+# common, good-sounding chords of pop/rock so the chart is easy to play
+# along to. Exotic qualities (dim, aug, sus, dim7, hdim7) win by tiny
+# margins on noisy chroma and produce chords that sound wrong, so they
+# are deliberately excluded here.
+FUNDAMENTAL_QUALITIES: list[str] = ['maj', 'min', '7', 'min7', 'maj7']
 
-def _build_templates() -> tuple[np.ndarray, list[tuple[str, str]]]:
-    """Build L2-normalised templates for all 12 roots × 11 qualities = 132 chords."""
+# Mild preference for plain triads over their 7th extensions, so a simple
+# C major isn't reported as Cmaj7 because of a single passing note.
+_QUALITY_BIAS: dict[str, float] = {
+    'maj': 1.00, 'min': 1.00, '7': 0.97, 'min7': 0.97, 'maj7': 0.97,
+}
+
+# Map any non-fundamental quality onto the nearest fundamental triad,
+# used to simplify the madmom backend's richer output.
+_SIMPLIFY_QUALITY: dict[str, str] = {
+    'dim': 'min', 'dim7': 'min', 'hdim7': 'min',
+    'aug': 'maj', 'sus2': 'maj', 'sus4': 'maj',
+}
+
+
+def _build_templates(qualities: list[str]) -> tuple[np.ndarray, list[tuple[str, str]], np.ndarray]:
+    """Build L2-normalised templates for 12 roots × the given qualities."""
     templates: list[np.ndarray] = []
     labels: list[tuple[str, str]] = []
-    for quality, profile in _QUALITY_PROFILES.items():
+    bias: list[float] = []
+    for quality in qualities:
+        profile = _QUALITY_PROFILES[quality]
         for root in range(12):
             t = np.roll(profile, root).astype(np.float32)
             t /= np.linalg.norm(t) + 1e-8
             templates.append(t)
             labels.append((NOTE_NAMES[root], quality))
-    return np.array(templates, dtype=np.float32), labels
+            bias.append(_QUALITY_BIAS.get(quality, 1.0))
+    return (np.array(templates, dtype=np.float32),
+            labels,
+            np.array(bias, dtype=np.float32))
 
 
-_TEMPLATES, _LABELS = _build_templates()   # (132, 12),  132 label pairs
+_TEMPLATES, _LABELS, _BIAS = _build_templates(FUNDAMENTAL_QUALITIES)
 
 
 # ── Data class ────────────────────────────────────────────────────────────────
@@ -103,6 +128,33 @@ class ChordEvent:
     root: str          # pitch class, e.g. "A"
     quality: str       # quality key, e.g. "min7"
     confidence: float  # 0.0–1.0
+
+
+def events_to_dicts(events: list[ChordEvent]) -> list[dict]:
+    """Serializa acordes para guardarlos junto a los stems (JSON plano)."""
+    return [asdict(ev) for ev in events]
+
+
+def events_from_dicts(data: list[dict]) -> list[ChordEvent]:
+    """
+    Reconstruye acordes guardados. Ignora entradas corruptas en vez de fallar:
+    un chords.json defectuoso debe degradar a "no hay acordes", no impedir que
+    el proyecto se abra.
+    """
+    events: list[ChordEvent] = []
+    for item in data:
+        try:
+            events.append(ChordEvent(
+                start=float(item['start']),
+                end=float(item['end']),
+                chord=str(item['chord']),
+                root=str(item['root']),
+                quality=str(item['quality']),
+                confidence=float(item.get('confidence', 0.0)),
+            ))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return events
 
 
 # ── Smoothing ─────────────────────────────────────────────────────────────────
@@ -144,8 +196,8 @@ def _detect_librosa(y_mono: np.ndarray, sr: int) -> list[ChordEvent]:
     """
     TARGET_SR = 22050
     HOP = 2048           # ~93 ms/frame — finer resolution than 4096
-    SMOOTH_WIN = 9       # majority vote over ~0.84 s to suppress noise
-    MIN_DUR = 0.5        # discard segments shorter than 500 ms
+    SMOOTH_WIN = 15      # majority vote over ~1.4 s — stable, less flicker
+    MIN_DUR = 1.0        # merge segments shorter than 1 s into neighbours
     SILENCE_RATIO = 0.02 # frames below 2 % of peak RMS = silence
 
     if sr != TARGET_SR:
@@ -172,8 +224,9 @@ def _detect_librosa(y_mono: np.ndarray, sr: int) -> list[ChordEvent]:
     T = chroma.shape[1]
     hop_sec = HOP / sr
 
-    # Cosine similarity: (T, 12) × (12, 132) → (T, 132)
+    # Cosine similarity: (T, 12) × (12, N) → (T, N)
     scores = (chroma.T @ _TEMPLATES.T).astype(np.float32)
+    scores *= _BIAS   # nudge results toward plain triads over 7th chords
 
     # Per-frame argmax → raw chord index per frame
     frame_chords = np.argmax(scores, axis=1).astype(np.int32)   # (T,)
@@ -210,16 +263,42 @@ def _detect_librosa(y_mono: np.ndarray, sr: int) -> list[ChordEvent]:
             seg_start = t
             prev = cur
 
-    # Absorb segments shorter than MIN_DUR into the previous one
-    merged: list[ChordEvent] = []
-    for ev in raw:
-        if ev.end - ev.start < MIN_DUR and merged:
-            p = merged[-1]
-            merged[-1] = ChordEvent(p.start, ev.end, p.chord, p.root, p.quality, p.confidence)
-        else:
-            merged.append(ev)
+    return _postprocess(raw, MIN_DUR)
 
-    return merged
+
+# ── Shared post-processing ──────────────────────────────────────────────────────
+
+def _simplify(ev: ChordEvent) -> ChordEvent:
+    """Collapse exotic qualities onto the nearest fundamental triad."""
+    quality = _SIMPLIFY_QUALITY.get(ev.quality)
+    if quality is None:
+        return ev
+    chord = ev.root + QUALITY_DISPLAY.get(quality, quality)
+    return ChordEvent(ev.start, ev.end, chord, ev.root, quality, ev.confidence)
+
+
+def _postprocess(events: list[ChordEvent], min_dur: float) -> list[ChordEvent]:
+    """
+    Make the chord chart easy to play along to:
+      1. simplify exotic qualities to fundamental triads,
+      2. merge consecutive identical chords,
+      3. absorb segments shorter than `min_dur` into the previous chord.
+    """
+    out: list[ChordEvent] = []
+    for ev in events:
+        ev = _simplify(ev)
+        if out and out[-1].root == ev.root and out[-1].quality == ev.quality:
+            # Same chord as previous — extend it instead of repeating
+            p = out[-1]
+            out[-1] = ChordEvent(p.start, ev.end, p.chord, p.root, p.quality,
+                                 max(p.confidence, ev.confidence))
+        elif out and ev.end - ev.start < min_dur:
+            # Too short to be musically meaningful — fold into previous
+            p = out[-1]
+            out[-1] = ChordEvent(p.start, ev.end, p.chord, p.root, p.quality, p.confidence)
+        else:
+            out.append(ev)
+    return out
 
 
 # ── madmom backend ────────────────────────────────────────────────────────────
@@ -265,7 +344,7 @@ def _detect_madmom(audio_path: str) -> list[ChordEvent]:
             quality=quality,
             confidence=0.92,
         ))
-    return events
+    return _postprocess(events, min_dur=1.0)
 
 
 # ── QThread worker ────────────────────────────────────────────────────────────
@@ -353,6 +432,10 @@ class ChordDetector:
         if on_error:
             self._worker.error.connect(on_error)
         self._worker.start()
+
+    @property
+    def events(self) -> list[ChordEvent]:
+        return self._events
 
     def set_events(self, events: list[ChordEvent]):
         self._events = events

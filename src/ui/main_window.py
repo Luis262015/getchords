@@ -12,13 +12,14 @@ from PySide6.QtWidgets import (
     QSplitter, QGroupBox, QMessageBox, QToolBar, QSizePolicy,
     QApplication
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QThread
+from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QKeySequence, QDragEnterEvent, QDropEvent, QFont
 
 from src.ai_separator import AISeparator, SUPPORTED_FORMATS
-from src.stem_manager import StemManager, STEM_COLORS, STEM_LABELS, STEM_ORDER
+from src.stem_manager import StemManager
 from src.playback_engine import PlaybackEngine
-from src.chord_detector import ChordDetector
+from src.chord_detector import ChordDetector, events_from_dicts, events_to_dicts
+from src.project_store import BUNDLE_EXT
 
 from .styles import DARK_STYLE
 from .transport_widget import TransportWidget
@@ -69,8 +70,8 @@ class DropZone(QWidget):
 
         if not AISeparator.is_available():
             warn = QLabel(
-                "⚠ Demucs no está instalado.\n"
-                "Ejecuta:  pip install demucs torch torchaudio"
+                "⚠ No se pudo cargar el motor de separación.\n"
+                f"{AISeparator.unavailable_reason() or 'motivo desconocido'}"
             )
             warn.setStyleSheet("color: #cc8040; font-size: 9pt; text-align: center;")
             warn.setAlignment(Qt.AlignCenter)
@@ -81,7 +82,7 @@ class DropZone(QWidget):
         if event.mimeData().hasUrls():
             url = event.mimeData().urls()[0]
             ext = Path(url.toLocalFile()).suffix.lower()
-            if ext in SUPPORTED_FORMATS:
+            if ext in SUPPORTED_FORMATS or ext == BUNDLE_EXT:
                 event.acceptProposedAction()
                 self._hover = True
                 self.update()
@@ -197,6 +198,22 @@ class MainWindow(QMainWindow):
         self._export_mix_btn.setToolTip("Exportar mezcla final como WAV")
         self._export_mix_btn.clicked.connect(self._export_mix)
         tb.addWidget(self._export_mix_btn)
+
+        tb.addSeparator()
+
+        # Proyecto .gcs: un archivo con stems y acordes ya resueltos, portable
+        # entre equipos sin repetir la separación.
+        self._export_proj_btn = QPushButton("📦  Exportar proyecto")
+        self._export_proj_btn.setEnabled(False)
+        self._export_proj_btn.setToolTip(
+            "Guardar stems y acordes en un archivo .gcs portable")
+        self._export_proj_btn.clicked.connect(self._export_project)
+        tb.addWidget(self._export_proj_btn)
+
+        open_proj_btn = QPushButton("📥  Abrir proyecto")
+        open_proj_btn.setToolTip("Abrir un archivo .gcs ya separado")
+        open_proj_btn.clicked.connect(self._open_project_dialog)
+        tb.addWidget(open_proj_btn)
 
         tb.addSeparator()
 
@@ -316,7 +333,8 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self, "Abrir archivo de audio",
             str(Path.home()),
-            "Audio (*.mp3 *.wav *.flac *.m4a *.aac *.ogg);;Todos (*)"
+            "Audio y proyectos (*.mp3 *.wav *.flac *.m4a *.aac *.ogg *.gcs);;"
+            "Proyecto GetChords (*.gcs);;Todos (*)"
         )
         if path:
             self._load_file(path)
@@ -334,19 +352,43 @@ class MainWindow(QMainWindow):
             self._load_file(urls[0].toLocalFile())
 
     def _load_file(self, path: str):
+        # Un .gcs no se separa: ya viene resuelto.
+        if Path(path).suffix.lower() == BUNDLE_EXT:
+            self._open_project_file(path)
+            return
+
+        # Descargar el proyecto anterior ANTES de intentar el caché. Si no, un
+        # fallo de caché dejaba cargados los stems de la canción previa: la app
+        # seguía reproduciéndolos y además no llegaba nunca a guardar los nuevos.
+        self._reset_project()
+
         self._current_file = path
         fname = Path(path).name
         self._transport.set_song_title(fname)
         self._set_status(f"Archivo cargado: {fname}")
         self._sep_btn.setEnabled(True)
 
-        # Check cache
         if self._stem_manager.load_from_cache(path):
             self._set_status(f"Stems cargados desde caché: {fname}")
-            self._on_separation_done(self._stem_manager.get_stems_audio())
+            self._activate_project()
         else:
-            # Auto-start separation
             self._run_separation()
+
+    def _reset_project(self):
+        """Deja la app sin proyecto cargado, lista para recibir otro."""
+        self._on_stop()
+        self._vu_timer.stop()
+        self._pos_timer.stop()
+        self._playback.load_stems({}, 44100)
+        self._stem_manager.clear()
+        self._chord_detector.clear()
+        self._chord_display.clear()
+        self._current_file = None
+        self._export_stem_btn.setEnabled(False)
+        self._export_mix_btn.setEnabled(False)
+        self._export_proj_btn.setEnabled(False)
+        self._chord_btn.setEnabled(False)
+        self._sep_btn.setEnabled(False)
 
     # ── AI Separation ─────────────────────────────────────────────────
 
@@ -372,7 +414,7 @@ class MainWindow(QMainWindow):
         if self._proc_dialog:
             self._proc_dialog.update_progress(pct, msg)
 
-    def _on_separation_done(self, stems_dict: dict):
+    def _on_separation_done(self, stems_dict: dict, samplerate: int):
         if self._proc_dialog:
             self._proc_dialog.accept()
             self._proc_dialog = None
@@ -380,24 +422,42 @@ class MainWindow(QMainWindow):
         if not stems_dict:
             return
 
-        sr = 44100
-        # Detect samplerate from manager if already stored
-        if not self._stem_manager.is_loaded():
-            self._stem_manager.load_from_separation(stems_dict, sr, self._current_file)
-        stems_audio = self._stem_manager.get_stems_audio()
-        sr = self._stem_manager.get_samplerate()
+        # Siempre se importa: el resultado recién separado es la fuente de verdad,
+        # y es esta llamada la que escribe el caché en disco.
+        self._stem_manager.load_from_separation(
+            stems_dict, samplerate, self._current_file)
+        self._set_status("Separación completada. ¡Listo para mezclar!")
+        self._activate_project()
 
-        self._playback.load_stems(stems_audio, sr)
+    def _activate_project(self):
+        """
+        Pone en marcha mezclador, ondas y reproducción para el proyecto ya
+        cargado en el StemManager, venga de separación, caché o bundle .gcs.
+        """
+        stems_audio = self._stem_manager.get_stems_audio()
+        if not stems_audio:
+            return
+
+        self._playback.load_stems(stems_audio, self._stem_manager.get_samplerate())
         self._rebuild_mixer()
         self._rebuild_waveforms()
 
         self._export_stem_btn.setEnabled(True)
         self._export_mix_btn.setEnabled(True)
+        self._export_proj_btn.setEnabled(True)
         self._chord_btn.setEnabled(True)
-        self._set_status("Separación completada. ¡Listo para mezclar!")
         self._vu_timer.start()
         self._pos_timer.start()
-        self._run_chord_detection()
+
+        # Si el proyecto trae acordes guardados no se vuelve a analizar: esa era
+        # la otra mitad del trabajo que se repetía en cada apertura.
+        events = events_from_dicts(self._stem_manager.cached_chords)
+        if events:
+            self._chord_detector.set_events(events)
+            self._set_status(
+                f"Proyecto listo · {len(events)} acordes recuperados sin recalcular.")
+        else:
+            self._run_chord_detection()
 
     def _on_separation_error(self, msg: str):
         if self._proc_dialog:
@@ -480,7 +540,7 @@ class MainWindow(QMainWindow):
         self._transport.set_playing(was_playing or self._playback.playing)
 
     def _on_master_volume(self, vol: float):
-        pass  # master volume slider reserved for future master-gain stage
+        self._playback.set_master_volume(vol)
 
     def _on_tempo_changed(self, speed: float):
         self._playback.set_speed(speed)
@@ -518,6 +578,7 @@ class MainWindow(QMainWindow):
         from PySide6.QtCore import QMetaObject, Qt as QtNs
         QMetaObject.invokeMethod(self, "_playback_ended", QtNs.QueuedConnection)
 
+    @Slot()
     def _playback_ended(self):
         self._transport.set_playing(False)
         self._transport.set_position(0.0, 0.0, self._playback.duration_seconds)
@@ -545,6 +606,8 @@ class MainWindow(QMainWindow):
     def _on_chord_done(self, events: list):
         self._chord_detector.set_events(events)
         self._chord_btn.setEnabled(True)
+        # Persistir junto a los stems para no repetir el análisis la próxima vez.
+        self._stem_manager.save_chords(events_to_dicts(events))
         n = len(events)
         self._set_status(f"Acordes detectados: {n} segmento{'s' if n != 1 else ''}.")
 
@@ -619,8 +682,77 @@ class MainWindow(QMainWindow):
             return
 
         params = self._playback.get_all_params()
-        self._stem_manager.export_mix(out_path, params)
+        # El maestro viaja aparte: no está en los parámetros por stem.
+        self._stem_manager.export_mix(
+            out_path, params, master_volume=self._playback.master_volume)
         QMessageBox.information(self, "Exportación completa", f"Mezcla guardada en:\n{out_path}")
+
+    # ── Proyectos .gcs ────────────────────────────────────────
+
+    def _export_project(self):
+        """Guarda stems y acordes en un solo archivo portable entre equipos."""
+        if not self._stem_manager.is_loaded():
+            return
+
+        base = self._stem_manager.source_name or (
+            Path(self._current_file).name if self._current_file else "proyecto")
+        suggested = str(Path.home() / (Path(base).stem + BUNDLE_EXT))
+
+        out_path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar proyecto GetChords", suggested,
+            f"Proyecto GetChords (*{BUNDLE_EXT})")
+        if not out_path:
+            return
+        if not out_path.lower().endswith(BUNDLE_EXT):
+            out_path += BUNDLE_EXT
+
+        self._set_status("Exportando proyecto…")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self._stem_manager.export_bundle(
+                out_path, events_to_dicts(self._chord_detector.events))
+        except Exception as exc:
+            QMessageBox.critical(self, "Error al exportar", str(exc))
+            self._set_status("Error al exportar el proyecto.")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        size_mb = Path(out_path).stat().st_size / (1024 * 1024)
+        self._set_status(f"Proyecto exportado ({size_mb:.0f} MB).")
+        QMessageBox.information(
+            self, "Proyecto exportado",
+            f"Guardado en:\n{out_path}\n\n"
+            f"Tamaño: {size_mb:.0f} MB\n\n"
+            "Puedes abrir este archivo en otro equipo sin repetir la separación.")
+
+    def _open_project_dialog(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Abrir proyecto GetChords", str(Path.home()),
+            f"Proyecto GetChords (*{BUNDLE_EXT})")
+        if path:
+            self._open_project_file(path)
+
+    def _open_project_file(self, path: str):
+        """Carga un .gcs: ni separación ni detección de acordes."""
+        self._reset_project()
+        self._set_status("Abriendo proyecto…")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            # Se deja también en el caché local, para que al abrir después el
+            # audio original se reconozca por contenido y cargue igual de rápido.
+            data = self._stem_manager.store.import_bundle_to_cache(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error al abrir el proyecto", str(exc))
+            self._set_status("No se pudo abrir el proyecto.")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        self._stem_manager.load_from_project(data)
+        self._transport.set_song_title(data.source_name or Path(path).name)
+        self._set_status(f"Proyecto abierto: {data.source_name or Path(path).name}")
+        self._activate_project()
 
     # ── Helpers ───────────────────────────────────────────────────────
 

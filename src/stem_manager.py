@@ -1,14 +1,18 @@
 """
-Manages stem track data: storage, caching, waveform peaks, and export.
+Manages stem track data: in-memory storage, waveform peaks, and export.
+
+La persistencia (caché en disco y bundles .gcs) vive en project_store.py: aquí
+solo se decide qué proyecto está cargado, no cómo se guarda.
 """
 
-import hashlib
-import math
 import numpy as np
 import soundfile as sf
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from dataclasses import dataclass, field
+
+from src import mixing
+from src.project_store import ProjectData, ProjectStore, file_key
 
 
 STEM_COLORS: Dict[str, str] = {
@@ -74,58 +78,95 @@ class StemTrack:
 
 
 class StemManager:
-    CACHE_DIR = Path.home() / '.getchords' / 'stems_cache'
-
-    def __init__(self):
+    def __init__(self, store: Optional[ProjectStore] = None):
+        self._store = store if store is not None else ProjectStore()
         self._stems: Dict[str, StemTrack] = {}
-        self._source_hash: Optional[str] = None
-        self.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        self._source_key: Optional[str] = None
+        self._source_name: str = ''
+        self._cached_chords: List[dict] = []
+
+    @property
+    def store(self) -> ProjectStore:
+        return self._store
+
+    @property
+    def source_key(self) -> Optional[str]:
+        return self._source_key
+
+    @property
+    def cached_chords(self) -> List[dict]:
+        """Acordes que venían con el proyecto cargado; vacío si hay que detectarlos."""
+        return self._cached_chords
 
     # ── Loading ───────────────────────────────────────────────────────
 
     def load_from_separation(self, stems_dict: Dict[str, np.ndarray],
-                              samplerate: int, source_file: str):
+                             samplerate: int, source_file: str):
         """Import raw numpy arrays from AISeparator, normalise and cache."""
-        self._stems.clear()
-
-        for name, audio in stems_dict.items():
-            audio = self._normalize_audio(audio)
-            stem = StemTrack(
-                name=name,
-                audio=audio,
-                samplerate=samplerate,
-            )
-            self._stems[name] = stem
+        self._set_stems(stems_dict, samplerate)
+        self._cached_chords = []
+        self._source_name = Path(source_file).name if source_file else ''
 
         try:
-            self._source_hash = self._file_hash(source_file)
-            self._write_cache()
-        except Exception as e:
-            print(f"[StemManager] Cache write error: {e}")
+            self._source_key = file_key(source_file) if source_file else None
+        except Exception as exc:
+            print(f"[StemManager] no se pudo calcular la clave del origen: {exc}")
+            self._source_key = None
+
+        if self._source_key:
+            self._store.save(self._source_key, self.get_stems_audio(),
+                             samplerate, self._source_name)
 
     def load_from_cache(self, source_file: str) -> bool:
-        """Returns True if cached stems were loaded successfully."""
+        """Returns True if a complete cached project was loaded."""
         try:
-            key = self._file_hash(source_file)
-            cache_dir = self.CACHE_DIR / key
-            if not cache_dir.exists():
-                return False
-
-            wav_files = list(cache_dir.glob('*.wav'))
-            if not wav_files:
-                return False
-
-            self._stems.clear()
-            for wav_path in wav_files:
-                audio, sr = sf.read(str(wav_path), dtype='float32', always_2d=True)
-                name = wav_path.stem
-                self._stems[name] = StemTrack(name=name, audio=audio, samplerate=sr)
-
-            self._source_hash = key
-            return True
-        except Exception as e:
-            print(f"[StemManager] Cache read error: {e}")
+            key = file_key(source_file)
+        except Exception as exc:
+            print(f"[StemManager] no se pudo leer el archivo de origen: {exc}")
             return False
+
+        data = self._store.load(key)
+        if data is None:
+            return False
+
+        self.load_from_project(data)
+        self._source_key = key
+        self._source_name = data.source_name or Path(source_file).name
+        return True
+
+    def load_from_project(self, data: ProjectData):
+        """Carga un proyecto ya materializado (caché o bundle .gcs importado)."""
+        self._set_stems(data.stems, data.samplerate)
+        self._source_key = data.source_key or None
+        self._source_name = data.source_name
+        self._cached_chords = list(data.chords)
+
+    def save_chords(self, chords: List[dict]) -> bool:
+        """Persiste los acordes detectados junto al proyecto en caché."""
+        self._cached_chords = list(chords)
+        if not self._source_key:
+            return False
+        return self._store.save_chords(self._source_key, chords)
+
+    def export_bundle(self, out_path: str, chords: Optional[List[dict]] = None):
+        """Escribe el proyecto completo como un archivo .gcs portable."""
+        self._store.export_bundle(
+            out_path,
+            stems=self.get_stems_audio(),
+            samplerate=self.get_samplerate(),
+            chords=chords if chords is not None else self._cached_chords,
+            source_name=self._source_name,
+            source_key=self._source_key or '',
+        )
+
+    def _set_stems(self, stems_dict: Dict[str, np.ndarray], samplerate: int):
+        self._stems.clear()
+        for name, audio in stems_dict.items():
+            self._stems[name] = StemTrack(
+                name=name,
+                audio=self._normalize_audio(audio),
+                samplerate=samplerate,
+            )
 
     # ── Accessors ─────────────────────────────────────────────────────
 
@@ -165,39 +206,47 @@ class StemManager:
             raise ValueError(f"Stem '{name}' not found.")
         sf.write(output_path, stem.audio, stem.samplerate)
 
-    def export_mix(self, output_path: str, mix_params: Dict[str, dict]):
-        """Render mixed output to a WAV file."""
+    def export_mix(self, output_path: str, mix_params: Dict[str, dict],
+                   master_volume: float = 1.0):
+        """
+        Renderiza la mezcla a WAV con la MISMA ley que la reproduccion.
+
+        `master_volume` debe recibir el valor del fader maestro: sin el, el
+        archivo exportado sale con un nivel distinto del que se escucha.
+        """
         if not self._stems:
             return
         sr = self.get_samplerate()
         total = self.get_total_frames()
         mixed = np.zeros((total, 2), dtype=np.float32)
 
-        any_soloed = any(p.get('soloed', False) for p in mix_params.values())
+        solo_active = mixing.any_soloed(mix_params)
 
         for name, stem in self._stems.items():
             params = mix_params.get(name, {})
-            if params.get('muted', False):
-                continue
-            if any_soloed and not params.get('soloed', False):
+            if not mixing.is_audible(params, solo_active):
                 continue
 
-            vol = float(params.get('volume', 1.0))
-            pan = float(params.get('pan', 0.0))
-            angle = (pan + 1.0) * (math.pi / 4.0)
-            l_gain = vol * math.cos(angle)
-            r_gain = vol * math.sin(angle)
-
+            l_gain, r_gain = mixing.stem_gains(params)
             n = stem.num_frames
             mixed[:n, 0] += stem.audio[:, 0] * l_gain
             mixed[:n, 1] += stem.audio[:, 1] * r_gain
 
+        if master_volume != 1.0:
+            mixed *= float(master_volume)
+
         np.clip(mixed, -1.0, 1.0, out=mixed)
         sf.write(output_path, mixed, sr)
 
+    @property
+    def source_name(self) -> str:
+        return self._source_name
+
     def clear(self):
         self._stems.clear()
-        self._source_hash = None
+        self._source_key = None
+        self._source_name = ''
+        self._cached_chords = []
 
     # ── Private ───────────────────────────────────────────────────────
 
@@ -211,19 +260,3 @@ class StemManager:
             if audio.shape[1] == 1:
                 audio = np.concatenate([audio, audio], axis=1)
         return audio.astype(np.float32)
-
-    def _write_cache(self):
-        if not self._source_hash:
-            return
-        cache_dir = self.CACHE_DIR / self._source_hash
-        cache_dir.mkdir(exist_ok=True)
-        for name, stem in self._stems.items():
-            sf.write(str(cache_dir / f'{name}.wav'), stem.audio, stem.samplerate)
-
-    @staticmethod
-    def _file_hash(path: str) -> str:
-        h = hashlib.md5()
-        with open(path, 'rb') as f:
-            while chunk := f.read(65536):
-                h.update(chunk)
-        return h.hexdigest()
